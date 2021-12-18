@@ -1,0 +1,365 @@
+---
+title: "Curso Web Scraping <br> Atividade Final"
+author: "Denis de Oliveira Rodrigues"
+date: "17/12/2021"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+## Descrição da página
+
+A Secretaria Estadual de Saúde de Minas Gerais possui um portal com um
+variado conteúdo que inclui notícias, legislação, instruções, normativas
+e boletins de dados epidemiológicos. Sob o endereço eletrônico:
+[saude.mg.gov.br](http://www.saude.mg.gov.br), esses conteúdos são
+segmentados por quatro classes principais:\
+a. Cidadão\
+b. Gestor\
+c. Profissional\
+d. Sobre.
+
+Além das seções, o site possui um vasto banco de notícias e uma área
+destinada às ações e notícias sobre coronavírus.
+
+**Figura 1. Snapshot da página da Secretaria Estadual de Saúde de Minas
+Gerais**
+
+![Imagem](webshot.png "Figura 1. Snapshot da página")
+
+Sobre os boletins epidemiológicos, a Secretaria os utiliza
+frequentemente para atualizar sobre a situação da Dengue, Chikungunya e
+Zika no Estado. Estes boletins são disponilizados em formato PDF e
+também em XLSX, embora não necessariamente simultâneos.
+
+Como o link sempre é diferente a cada nova postagem no site e também os
+arquivos que são publicados separados, não é possível ter uma única ação
+automatizada que busque rotineiramente o mesmo conteúdo. Além disso, os
+arquivos de óbitos e de casos são separados. A solução para este
+problema foi a motivação deste trabalho.
+
+## Objetivo do *scraping*
+
+Nosso objetivo para a atividade é buscar o boletim mais atualizado e
+gerar um mapa da situação atual da dengue no Estado de Minas Gerais,
+apontando os municípios com maior incidência e maior número de óbitos.
+
+Para isso, vamos seguir as seguintes etapas:
+
+a.  utilizar o campo de busca da página para buscar boletins sobre
+    **Dengue** publicados no formato **XLSX**;
+b.  extrair o conteúdo da busca;
+c.  localizar o mais recente;
+d.  scrapear a página mais recente para buscar o arquivo XLSX;
+e.  realizar o download dos arquivos;
+f.  montar uma base para mapeamento no R.
+
+## Etapas
+
+### Requisições
+
+Para imitar a requisição de busca, primeiramente, foi realizada uma
+inspeção no site principal, analisando elementos de html e
+ações/conexões realizadas ao utilizar o campo de busca, no topo do site.
+As palavras chaves utilizadas foram: "Boletim Monitoramento xlsx
+Dengue". O site direciona a busca para outra página
+<https://www.saude.mg.gov.br/component/search/> que resgata as palavras
+chaves e monta uma estrutura de conteúdos correspondentes.
+
+Com as palavras chaves utilizadas, blocos são montados apresentando o
+resultado. O conteúdo mais recente é apresentado primeiro. Os blocos são
+linkados a uma novas páginas que contém uma breve descrição sobre a
+situação da dengue chinkungunya e zika na data do boletim e os links
+para download dos arquivos xlsx.
+
+Com este cenário, os primeiros passos foram seguidos:
+
+```{r}
+url_busca <- 'https://www.saude.mg.gov.br/component/search/'
+
+q_busca <- "Boletim Monitoramento xlsx Dengue"
+
+query <- list(
+  "all" = q_busca,
+  "area" = "all")
+
+user_agent <- "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.71 Safari/537.36"
+
+r <- httr::GET(url_busca,
+               query = query,
+               httr::user_agent(user_agent))
+
+```
+
+Observação: foi necessária a inclusão do item user_agent na requisição
+GET.
+
+Como resposta, foi retornada a página contendo os blocos invididuais
+para cada boletim. Como foi visto anteriormente que o mais recente é
+listado primeiro, utilizamos o seguinte código para extrair os links de
+dentro do bloco:
+
+```{r}
+ws <- xml2::read_html(r) |>
+  xml2::xml_find_first('//div[@class="content"]//a') |>
+  rvest::html_attr('href')
+```
+
+Este link foi concatenado com a url do site principal para relaização de
+uma nova requisição:
+
+```{r}
+url_base <- 'https://www.saude.mg.gov.br/'
+q2 <- paste0(url_base, ws)
+r2 <- xml2::read_html(q2)
+```
+
+Os arquivos disponíveis para download na página ficam sob uma classe
+chamada *wf_file_text* . Logo, foi localizada na página qualquer link
+que correspondia ao padrão *wf_file*. Além disso, links que continham a
+sequência xlsx, relativo à extensão do arquivo buscado, foram mantidos:
+
+```{r}
+wf <- r2 |>
+  xml2::xml_find_all("//a[contains(@class, 'wf_file')]") |>
+  rvest::html_attr('href') |>
+  purrr::keep(stringr::str_detect, "xlsx")
+```
+
+Uma nova concatenação foi feita para download dos arquivos. Dois
+arquivos xlsx foram localizados. Um de óbitos por dengue e um de
+incidência de dengue. Ambos por município de residência do paciente
+acometido. Os dois arquivos foram baixados e salvos numa lista:
+
+```{r}
+q3 <- paste0(url_base, wf)
+
+baixa_arquivos <- function(url){
+  tmp <- tempfile()
+  curl::curl_download(url, tmp)
+  tabela <- readxl::read_xlsx(tmp, skip = 2)
+  tabela <- janitor::clean_names(tabela)
+  tabela
+}
+
+base_grande <- purrr::map(q3,baixa_arquivos)
+
+```
+
+### Arrumando e unificando a base
+
+A base possui alguns vícios comuns ao utilizar planilhas eletrônicas
+como falta de uma padronização no nome das colunas, linhas em branco no
+cabeçalho, entre outros. Antes da organização de uma base única, as
+tabelas de casos e óbitos foram arrumadas para um perfil que gere uma
+correspondência.
+
+Primeiro, a tabela de casos:
+
+```{r}
+
+tabela_casos <- base_grande[[1]]
+cabecalho <- tabela_casos[1,]|>as.character()
+colnames(tabela_casos)<- cabecalho
+tabela_casos <- tabela_casos[-1,]|>janitor::clean_names()
+
+tabela_casos <- tabela_casos|>
+  dplyr::mutate(coef_inc_acum = as.numeric(coef_incid_acumulada)) |>
+  dplyr::select(codigo_ibge,
+                municipio,
+                coef_inc_acum,
+                incidencia)
+
+
+```
+
+E depois a tabela de óbitos:
+
+```{r}
+
+tabela_obitos <- base_grande[[2]]
+
+tabela_obitos <- dplyr::rename(
+  tabela_obitos,
+  codigo_ibge = ibge
+  ) |>
+  dplyr::select(codigo_ibge,
+                municipio_de_residencia,
+                obito = obito_pelo_agravo_notificado)
+
+```
+
+E unificando:
+
+```{r}
+tab_final <- dplyr::left_join(tabela_casos,tabela_obitos) |> 
+  dplyr::select(codigo_ibge, 
+                municipio, 
+                coef_inc_acum,
+                incidencia,
+                obito)
+```
+
+A base final teve a seguinte estrutura:
+
+codigo_ibge: Código de identificação do município de residência do
+paciente segundo IBGE;
+
+municipio: Descrição do nome do município de residência do paciente;
+
+coef_inc_acum: Indicador de incidência (número de casos prováveis para
+Dengue no município de reisdência do paciente dividido pela população do
+município de residência do paciente multiplicado por 100 mil);
+
+incidencia: Classificação de incidência segundo a Secretaria Estadual de
+Saúde;
+
+obito: número absoluto de óbito confirmado para Dengue.
+
+```{r}
+dplyr::glimpse(tab_final)
+```
+
+### Visualização
+
+Para a elaboração do mapa, o pacote `geobr` é útil para download da base
+geográfica de Minas Gerais.
+
+```{r echo=T,warning=F, message=F, comment=F}
+minas_map <- geobr::read_municipality(code_muni = 31,
+                                      showProgress = F) |>
+  dplyr::mutate(codigo_ibge = as.character(substr(code_muni, 1, 6))) |>
+  dplyr::left_join(tab_final)
+```
+
+Analisando a incidência acumulada (Figura 2) percebe-se poucos
+municípios com incidência alta. Entretanto, este mapa não representa bem
+a situação da dengue, pois há um efeito de não registro de casos pelos
+municípios, representado na Figura 3.
+
+**Figura 2. Coeficiente de incidência acumulada de dengue.**
+
+```{r fig.width=9}
+ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = minas_map,
+    ggplot2::aes(fill = coef_inc_acum),
+    color = '#bdbdbd',
+    size = .1) +
+  viridis::scale_fill_viridis(name = "Incidência \n Dengue \n (por 100 mil hab)",
+                              discrete = F,
+                              direction = -1) +
+  ggspatial::annotation_scale(location = 'br', style = "ticks") +
+  ggspatial::annotation_north_arrow(location = 'tr',
+                                    style = ggspatial:::north_arrow_fancy_orienteering()) +
+  ggplot2::annotate(
+    "text",
+    x = -50.5,
+    y = -23,
+    label = "Datum SIRGAS 2000 \n Projeção Lat Long",
+    size = 3) +
+  ggplot2::theme_minimal() +
+  ggplot2::ggtitle("Incidência da dengue") +
+  ggplot2::ylab("Latitude") + ggplot2::xlab("Longitude")
+```
+
+Analisando a Figura 3, percebe-se um alto número de municípios com a
+classificação "silencioso". Essa classificação representa que o
+município não realizou o processo de notificação de nenhum caso de
+Dengue à instância estadual. A recomendação é que, mesmo que o município
+não possua nenhum registro de Dengue, que informe a situação zerada.
+Tambpem é possível visualizar que a maioria daqueles municípios que não
+estão classificados como silenciosos, a incidência é baixa.
+
+**Figura 3. Incidência de dengue conforme classificação de risco.**
+
+```{r fig.width=9, echo=FALSE, warning=F, message=F, comment=F}
+ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = minas_map,
+    ggplot2::aes(fill = incidencia),
+    color = '#bdbdbd',
+    size = .1) +
+  viridis::scale_fill_viridis(name = "Incidência da Dengue",
+                              discrete = T,
+                              direction = -1) +
+  ggspatial::annotation_scale(location = 'br', style = "ticks") +
+  ggspatial::annotation_north_arrow(location = 'tr',
+                                    style = ggspatial:::north_arrow_fancy_orienteering()) +
+  ggplot2::annotate(
+    "text",
+    x = -50.5,
+    y = -23,
+    label = "Datum SIRGAS 2000 \n Projeção Lat Long",
+    size = 3) +
+  ggplot2::theme_minimal() +
+  ggplot2::ggtitle("Incidência da dengue") +
+  ggplot2::ylab("Latitude") + ggplot2::xlab("Longitude")
+```
+
+```{r fig.width=9}
+tab_compact_ob <- tab_final |>
+  dplyr::filter(!is.na(obito), obito>0) |>
+  dplyr::arrange(desc(obito)) |>
+  dplyr::mutate(municipio = forcats::fct_reorder(municipio, obito))
+
+gg1 <- ggplot2::ggplot(data = tab_compact_ob,
+                ggplot2::aes(x = obito, y = municipio)) +
+  ggplot2::geom_col(fill = "#FDE725FF") +
+  ggplot2::geom_text(ggplot2::aes(label = obito),
+                     hjust = 1.2,
+                     color = "black") +
+  ggplot2::labs(x = "Número de óbitos",
+                y = "Municípios",
+                tag = "A",
+                title = "Número de óbitos") +
+  ggplot2::theme_bw()
+```
+
+```{r fig.width=7}
+
+tab_compact_cs <- tab_final |>
+  dplyr::arrange(desc(coef_inc_acum)) |>
+  head(10) |>
+  dplyr::mutate(municipio = forcats::fct_reorder(municipio, coef_inc_acum))
+
+gg2 <- ggplot2::ggplot(data = tab_compact_cs,
+                ggplot2::aes(x = coef_inc_acum, y = municipio)) +
+  ggplot2::geom_col(fill = "#1F968BFF") +
+  ggplot2::geom_text(ggplot2::aes(label = round(coef_inc_acum, 2)),
+                     hjust = 1.2,
+                     color = "white") +
+  ggplot2::labs(x = "Coeficiente de incidência acumulada",
+                y = "Municípios",
+                tag = "B",
+                title = "Coeficiente de incidência acumulada") +
+  ggplot2::theme_bw()
+
+
+```
+
+O número de óbito é baixo. Apenas 11 municípios confirmaram óbito por
+dengue em Minas Gerais (Figura 4A), mas alguns regitram uma incidência
+alta e muito altada doença (Figura 4B). O município de Resplendor se
+destaca pela alta incidência em um cenário de baixa em Minas Gerais.
+
+**Figura 4. Ranking dos municípios mais acometidos pela Dengue em Minas
+Gerais.**
+
+<center>
+
+```{r fig.width=9, fig.height=7}
+patchwork::wrap_plots(gg1, gg2, nrow = 2)
+```
+
+</center>
+
+Salvando a base final:\
+
+```{r}
+readr::write_csv2(tab_final, "tab_final.csv")
+```
